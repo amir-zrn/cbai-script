@@ -17,8 +17,20 @@ use Illuminate\Support\Facades\Validator;
 class OpenAIController extends Controller
 {
     private const OPENAI_API_URL = 'https://api.openai.com/';
+
+    /**
+     * @var Client
+     */
     private Client $client;
+
+    /**
+     * @var FileLogger
+     */
     private FileLogger $logger;
+
+    /**
+     * @var Gpt3Tokenizer
+     */
     private Gpt3Tokenizer $tokenizer;
 
     private const ALLOWED_SIZES = [
@@ -128,7 +140,7 @@ class OpenAIController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-    public function cancelBatch(Request $request) : JsonResponse
+    public function cancelBatch(Request $request): JsonResponse
     {
         return $this->proxyToOpenAI('/batches/' . $request->route('batchId') . '/cancel', $request);
     }
@@ -139,7 +151,7 @@ class OpenAIController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-    public function uploadFile(Request $request) : JsonResponse
+    public function uploadFile(Request $request): JsonResponse
     {
         return $this->proxyToOpenAI('/files', $request);
     }
@@ -150,7 +162,7 @@ class OpenAIController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-    public function retrieveFile(Request $request) : JsonResponse
+    public function retrieveFile(Request $request): JsonResponse
     {
         return $this->proxyToOpenAI('/files/' . $request->route('fileId'), $request);
     }
@@ -161,7 +173,7 @@ class OpenAIController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-    public function retrieveFileContent(Request $request) : JsonResponse
+    public function retrieveFileContent(Request $request): JsonResponse
     {
         return $this->proxyToOpenAI('/files/' . $request->route('fileId') . '/content', $request);
     }
@@ -172,7 +184,7 @@ class OpenAIController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-    public function deleteFile(Request $request) : JsonResponse
+    public function deleteFile(Request $request): JsonResponse
     {
         return $this->proxyToOpenAI('/files/' . $request->route('fileId'), $request);
     }
@@ -259,6 +271,12 @@ class OpenAIController extends Controller
 
         try {
             $userId = $request->header('X-WP-User-ID');
+            if (!$userId || !is_numeric($userId)) {
+                return response()->json([
+                    'error' => 'Invalid user ID',
+                    'timestamp_utc' => gmdate('Y-m-d H:i:s')
+                ], 401);
+            }
             $stats = $this->logger->getUserStats($userId);
             $totalAllowed = ApiKey::where('api_key', $request->header('X-API-Key'))->value('total_tokens_allocated');
             $remainingTokens = $totalAllowed - $stats['total_tokens'];
@@ -285,13 +303,13 @@ class OpenAIController extends Controller
 
             $cacheKey = 'api_calls:' . $userId . ':' . date('Y-m-d-H-i');
             $calls = Cache::get($cacheKey, 0);
-            if ($calls >= 60) { // 60 calls per minute
+            if ($calls >= 60) {
                 return response()->json([
                     'error' => 'Rate limit exceeded',
                     'timestamp_utc' => gmdate('Y-m-d H:i:s')
                 ], 429);
             }
-            Cache::put($cacheKey, $calls + 1, 60);
+            Cache::put($cacheKey, $calls + 1, config('openai.rate_limit', 60));
 
             $response = $this->client->post('v1' . $endpoint, [
                 'json' => $requestBody,
@@ -308,12 +326,20 @@ class OpenAIController extends Controller
             return response()->json($responseBody, $response->getStatusCode());
 
         } catch (GuzzleException $e) {
+            $statusCode = $e->hasResponse() ? $e->getResponse()->getStatusCode() : 500;
+            $errorMessage = match ($statusCode) {
+                401 => 'Authentication error with OpenAI',
+                429 => 'OpenAI rate limit exceeded',
+                500, 502, 503, 504 => 'OpenAI service temporarily unavailable',
+                default => 'OpenAI API request failed'
+            };
+
             return response()->json([
-                'error' => 'OpenAI API request failed',
+                'error' => $errorMessage,
                 'message' => $e->getMessage(),
                 'timestamp_utc' => gmdate('Y-m-d H:i:s'),
                 'wp_user_id' => $request->header('X-WP-User-ID')
-            ], 500);
+            ], $statusCode);
         }
     }
 
@@ -369,7 +395,8 @@ class OpenAIController extends Controller
                 break;
         }
 
-        return $promptTokens;
+        // Add 10% safety buffer
+        return (int) ceil($promptTokens * 1.1);
     }
 
     /**
@@ -385,7 +412,8 @@ class OpenAIController extends Controller
             '/chat/completions' => [
                 'messages' => 'required|array',
                 'messages.*.role' => 'required|string|in:system,user,assistant',
-                'messages.*.content' => 'required|string'
+                'messages.*.content' => 'required|string',
+                'model' => 'required|string|in:' . implode(',', array_keys(self::MODEL_ENCODINGS))
             ],
             '/completions' => [
                 'prompt' => 'required|string'
