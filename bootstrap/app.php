@@ -112,4 +112,18 @@ $app->router->group([
     require __DIR__.'/../routes/web.php';
 });
 
+$app->routeMiddleware([
+    'track.api' => App\Http\Middleware\TrackApiUsage::class,
+]);
+
+$app->register(App\Providers\FileLoggerServiceProvider::class);
+
+$app->middleware([
+    App\Http\Middleware\TrackApiUsage::class
+]);
+
+$app->withFacades();
+
+$app->withEloquent();
+
 return $app;
