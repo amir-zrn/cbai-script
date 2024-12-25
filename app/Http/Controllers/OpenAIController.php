@@ -11,6 +11,7 @@ use GuzzleHttp\Client;
 use App\Services\FileLogger;
 use GuzzleHttp\Exception\GuzzleException;
 use App\Services\OpenAI\ImageTokenCalculator;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 
 class OpenAIController extends Controller
@@ -18,6 +19,7 @@ class OpenAIController extends Controller
     private const OPENAI_API_URL = 'https://api.openai.com/';
     private Client $client;
     private FileLogger $logger;
+    private Gpt3Tokenizer $tokenizer;
 
     private const ALLOWED_SIZES = [
         '256x256',
@@ -66,10 +68,11 @@ class OpenAIController extends Controller
     public function __construct(FileLogger $logger)
     {
         $this->logger = $logger;
+        $this->tokenizer = new Gpt3Tokenizer(new Gpt3TokenizerConfig());
         $this->client = new Client([
             'base_uri' => self::OPENAI_API_URL,
             'headers' => [
-                'Authorization' => 'Bearer ' . env('OPENAI_API_KEY'),
+                'Authorization' => 'Bearer ' . config('openai.api_key'),
                 'Content-Type' => 'application/json',
             ]
         ]);
@@ -262,6 +265,12 @@ class OpenAIController extends Controller
 
             // token calculation before making the request
             $requestBody = $request->all();
+            if (!$this->validateRequest($requestBody, $endpoint)) {
+                return response()->json([
+                    'error' => 'Invalid request parameters',
+                    'timestamp_utc' => gmdate('Y-m-d H:i:s')
+                ], 422);
+            }
             $estimatedTokens = $this->calculateRequestTokens($requestBody, $endpoint);
 
             // check if estimated tokens would exceed remaining tokens
@@ -274,13 +283,28 @@ class OpenAIController extends Controller
                 ], 403);
             }
 
+            $cacheKey = 'api_calls:' . $userId . ':' . date('Y-m-d-H-i');
+            $calls = Cache::get($cacheKey, 0);
+            if ($calls >= 60) { // 60 calls per minute
+                return response()->json([
+                    'error' => 'Rate limit exceeded',
+                    'timestamp_utc' => gmdate('Y-m-d H:i:s')
+                ], 429);
+            }
+            Cache::put($cacheKey, $calls + 1, 60);
+
             $response = $this->client->post('v1' . $endpoint, [
                 'json' => $requestBody,
                 'http_errors' => false
             ]);
 
             $responseBody = json_decode($response->getBody()->getContents(), true);
-
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                return response()->json([
+                    'error' => 'Invalid response from OpenAI',
+                    'timestamp_utc' => gmdate('Y-m-d H:i:s')
+                ], 500);
+            }
             return response()->json($responseBody, $response->getStatusCode());
 
         } catch (GuzzleException $e) {
@@ -303,7 +327,6 @@ class OpenAIController extends Controller
      */
     private function calculateRequestTokens(array $requestBody, string $endpoint): int
     {
-        $tokenizer = new Gpt3Tokenizer(new Gpt3TokenizerConfig());
         $promptTokens = 0;
 
         // change normal image generation to use the new token calculation
@@ -316,7 +339,7 @@ class OpenAIController extends Controller
             case '/chat/completions':
                 if (isset($requestBody['messages'])) {
                     foreach ($requestBody['messages'] as $message) {
-                        $promptTokens += count($tokenizer->encode($message['content']));
+                        $promptTokens += count($this->tokenizer->encode($message['content']));
                     }
                 }
                 break;
@@ -325,10 +348,10 @@ class OpenAIController extends Controller
                 if (isset($requestBody['prompt'])) {
                     if (is_array($requestBody['prompt'])) {
                         foreach ($requestBody['prompt'] as $prompt) {
-                            $promptTokens += count($tokenizer->encode($prompt));
+                            $promptTokens += count($this->tokenizer->encode($prompt));
                         }
                     } else {
-                        $promptTokens += count($tokenizer->encode($requestBody['prompt']));
+                        $promptTokens += count($this->tokenizer->encode($requestBody['prompt']));
                     }
                 }
                 break;
@@ -337,15 +360,46 @@ class OpenAIController extends Controller
                 if (isset($requestBody['input'])) {
                     if (is_array($requestBody['input'])) {
                         foreach ($requestBody['input'] as $text) {
-                            $promptTokens += count($tokenizer->encode($text));
+                            $promptTokens += count($this->tokenizer->encode($text));
                         }
                     } else {
-                        $promptTokens += count($tokenizer->encode($requestBody['input']));
+                        $promptTokens += count($this->tokenizer->encode($requestBody['input']));
                     }
                 }
                 break;
         }
 
         return $promptTokens;
+    }
+
+    /**
+     * Validate Request
+     *
+     * @param array $requestBody
+     * @param string $endpoint
+     * @return bool
+     */
+    private function validateRequest(array $requestBody, string $endpoint): bool
+    {
+        $validators = [
+            '/chat/completions' => [
+                'messages' => 'required|array',
+                'messages.*.role' => 'required|string|in:system,user,assistant',
+                'messages.*.content' => 'required|string'
+            ],
+            '/completions' => [
+                'prompt' => 'required|string'
+            ],
+            '/images/generations' => [
+                'prompt' => 'required|string|max:4000',
+                'size' => 'sometimes|string|in:' . implode(',', self::ALLOWED_SIZES)
+            ]
+        ];
+
+        if (isset($validators[$endpoint])) {
+            $validator = Validator::make($requestBody, $validators[$endpoint]);
+            return !$validator->fails();
+        }
+        return true;
     }
 }
